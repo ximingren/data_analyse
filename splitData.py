@@ -31,6 +31,7 @@ def split(data, result_col, need_split_col):
             # 只用加一行
             count.append(1)
             # 加上相应的列
+            eachData.append(data.iloc[i]['销售数量'])
             eachData.append(data.iloc[i]['主营业务收入'])
             eachData.append(data.iloc[i]['销项税额'])
             eachData.append(data.iloc[i]['含税销售额(净额)'])
@@ -119,7 +120,25 @@ def create_directory(path):
         pass
 
 
-def pre_process(raw_data, reduce_data, reference_data, need_col, need_reference_col, result_col,group_index):
+def fillna_reduce_table(data, summary_data, merged_raw_data):
+    """
+    核减之后的表中有nan值，将其补充完整。
+    补充完后缺失部分列的值，将其补充完整。
+    :param data:  核减后的数据
+    :param summary_data: 核减后填充nan值所用的参考数据
+    :param merged_raw_data: 用以补充客户、产品等列的参考数据
+    :return: 经过补充填充后的数据
+    """
+    data = data.combine_first(summary_data)  # 对未对应得上的数据进行填充处理
+    merged_raw_data = merged_raw_data.reindex(columns=result_col).set_index(['购货单位', '产品'])  # 对未分组的数据进行处理，设置列排序，设置层次索引
+    data = data.reindex(columns=result_col.drop(['购货单位', '产品']))  # 设置列排序（其实是新添多个列）
+    group_index2 = ['购货单位', '产品', '客户', '利润中心', '产品号', '税率']
+    merged_raw_data = merged_raw_data.groupby(group_index2).sum().reset_index().set_index(group_index)
+    fill_data = data.combine_first(merged_raw_data)  # 两个表填充
+    return fill_data
+
+
+def pre_process(raw_data, reduce_data, reference_data, need_col, need_reference_col, result_col, group_index):
     """
     对总数据表进行预处理
     步骤有：1.依据参照表对总数据表和核减表进行合并添加相应的列
@@ -143,44 +162,107 @@ def pre_process(raw_data, reduce_data, reference_data, need_col, need_reference_
         {'销售数量': 'sum', '主营业务收入': 'sum', '销项税额': 'sum', '含税销售额(净额)': 'sum'})  # 分组操作并聚合运算
     reduce_data = merged_reduce_data.groupby(group_index).agg(
         {'销售数量': 'sum', '主营业务收入': 'sum', '销项税额': 'sum', '含税销售额(净额)': 'sum'})  # 分组操作并聚合运算
-    data = (summary_data - reduce_data)  # 核减操作
-    data = data.combine_first(summary_data)  # 对未对应得上的数据进行填充处理
-    merged_raw_data = merged_raw_data.reindex(columns=result_col).set_index(['购货单位', '产品'])  # 对未分组的数据进行处理，设置列排序，设置层次索引
-    data = data.reindex(columns=result_col.drop(['购货单位', '产品']))  # 设置列排序（其实是新添多个列）
-    group_index2 = ['购货单位', '产品', '客户', '利润中心', '产品号', '税率']
-    merged_raw_data=merged_raw_data.groupby(group_index2).sum().reset_index().set_index(group_index)
-    data = data.combine_first(merged_raw_data)  # 两个表填充
-    data.to_excel('./result/before_split_total_data.xls')  # 导出拆分之前的总数据，但是核减过后的
-    return data
+    # data = (summary_data - reduce_data)  # 核减操作
+    data = summary_data.sub(reduce_data)  # 核减操作
+    fill_data = fillna_reduce_table(data, summary_data, merged_raw_data)  # 进行补充操作
+    fill_data.to_excel('./result/before_split_total_data.xls')  # 导出拆分之前的总数据，但是核减过后的
+    return fill_data
+
+
+def process_invoice(shop_unit, tax):
+    """
+    添加发票张数的时候要根据限制值返回具体的张数标志
+    :param shop_unit: 每一行购货单位
+    :param tax: 每一行税率
+    :return: 发票张数标志
+    """
+    global eachgroup_num, last_shop_unit, last_tax, invoice_group_num
+    # 如果这一行的数据和上一行相同，则增加当前组的数量
+    if (last_shop_unit != shop_unit) == (last_tax != tax):
+        eachgroup_num += 1
+    #  购货单位不同，就加一个组
+    if last_shop_unit != shop_unit:
+        invoice_group_num += 1
+        last_shop_unit = shop_unit
+        last_tax = tax
+        eachgroup_num = 0
+    # 购货单位相同、但是税率不同，加一个组
+    elif last_tax != tax:
+        invoice_group_num += 1
+        last_tax = tax
+        eachgroup_num = 0
+    # 如果当前组的数量超过了限制值，加一组
+    if eachgroup_num >= invoice_threshold:
+        invoice_group_num += 1
+        eachgroup_num = 0
+    return "A" + str(invoice_group_num)
+
+
+def add_invoice_num(diff_result):
+    """
+    添加发票张数这一列
+    :param diff_result: 添加完差异列后的总数据表
+    :return: 添加完发票张数后的总数据表
+    """
+    global eachgroup_num, last_shop_unit, last_tax, invoice_group_num
+    eachgroup_num = 0  # 每一个相同的发票张数标志的数量
+    last_shop_unit = last_tax = None  # 上一行的购货单位，上一行的税率
+    invoice_group_num = 0  # 发票张数的数字标志
+    diff_result['发票张数'] = diff_result.apply(lambda x: process_invoice(x['购货单位'], x['税率']),
+                                            axis=1)  # apply函数将每一行的购货单位和税率当作参数传入函数中进行处理
+    return diff_result
+
+
+def add_invoice_properties(tax, cumstomer):
+    """
+    增加发票性质这一列
+    :param tax: 每一行的税率
+    :param cumstomer: 每一行的客户代码
+    :return: 发票性质标志
+    """
+    if tax == 0.16:
+        return "专票"
+    if tax == 0.10:
+        if special_tickets_refernce_customers.isin([cumstomer]).any():
+            return "专票"
+        return "普票"
 
 
 if __name__ == '__main__':
     """下面的配置变量有点多,找机会改一下看怎么弄，怎么简化它"""
     pd.set_option('display.width', 200)
-    reduce_file = '8.xls'
-    rawData_file = "7.xls"
-    reference_file = '参照表 (1).xlsx'
-    create_directory("./result")
-    split_result_file = './result/final_result5.xls'
-    # 设置阈值
-    split_threshold = 30000
-    # 经过分组整合后的数据
+    reduce_file = './rawdata/核减表（测试）.XLSX'  # 核减表
+    rawData_file = "./rawdata/汇总表（测试）.XLSX"  # 原始总数据表
+    reference_file = './rawdata/购货单位和利润中心参照表 (1).xlsx'  # 参照表,用以添加购货单位和利润中心
+    special_tickets_reference_file = "./rawdata/专票客户.xlsx"  # 用以修改税率为.1中的普票的参照表
+    create_directory("./result")  # 创建存放结果集的目录
+    split_result_file = './result/final_result7.xls'
+    split_threshold = 30000  # 设置划分阈值
+    merge_threshold = 3000  # 设置合并阈值
+    invoice_threshold = 15  # 设置发票张数限制值
     reduce_data = pd.read_excel(reduce_file)  # 核减的数值
     raw_data = pd.read_excel(rawData_file)  # 为处理过的总数据
     reference_data = pd.read_excel(reference_file).fillna(0)  # 参照表的数据,并将nan值填充0
+    special_tickets_refernce_data = pd.read_excel(special_tickets_reference_file) # 专票参照数据
     need_col = pd.Index(['客户', '产品号', '产品', '税率', '销售数量', '主营业务收入', '销项税额', '含税销售额(净额)'])  # 处理raw数据需要用到的列
     need_reference_col = pd.Index(['客户', '购货单位', '利润中心'])  # 参照表需要用到的列
     result_col = pd.Index(['购货单位', '产品', '客户', '利润中心', '产品号', '税率', '销售数量', '主营业务收入', '销项税额', '含税销售额(净额)'])  # 结果集的列
     group_index = ['购货单位', '产品']  # 分组依据的索引
     print("进行数据预处理")
-    data = pre_process(raw_data, reduce_data, reference_data, need_col, need_reference_col, result_col,group_index)  # 预处理操作
+    data = pre_process(raw_data, reduce_data, reference_data, need_col, need_reference_col, result_col,
+                       group_index)  # 预处理操作
     # 取得是‘主营业务收入’,对这一列数据进行判断
     need_split_col = data['主营业务收入']
     # 拆分数据,返回的是拆分后的结果
     print("进行数据拆分")
     split_result = split(data, result_col, need_split_col)
-    # 计算出拆分前与拆分后的差异值
+    # 计算出拆分前与拆分后的差异值,返回的是有差异列的结果集
     print("进行计算差异")
     diff_result = diff(split_result)
-    diff_result=diff_result.set_index(group_index)
+    print("进行添加发票张数一列")
+    diff_result = add_invoice_num(diff_result)
+    print("进行添加发票性质一列")
+    special_tickets_refernce_customers = special_tickets_refernce_data['客户'] #专票参照数据表中的客户代码
+    diff_result['发票性质'] = diff_result.apply(lambda x: add_invoice_properties(x['税率'], x['客户']), axis=1)
+    diff_result = diff_result.set_index(group_index)  # 设置为多级索引
     diff_result.to_excel(split_result_file)
